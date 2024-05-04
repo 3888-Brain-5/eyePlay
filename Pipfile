@@ -6,9 +6,16 @@ name = "pypi"
 [packages]
 pynput = "*"
 pyserial = "*"
-nbdev = "*"
+spotipy = "*"
 
 [dev-packages]
+nbdev = "*"
+jupyterlab = "*"
+numpy = "*"
+matplotlib = "*"
+tsfeatures = "*"
+tqdm = "*"
+pre-commit = "*"
 
 [requires]
-python_version = "3.11"
+python_version = "3.12"
