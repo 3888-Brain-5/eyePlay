@@ -1,6 +1,8 @@
 import json
+import queue
 import threading
 import tkinter as tk
+from functools import partial
 from enum import Enum
 from pathlib import Path
 from tkinter import ttk
@@ -11,21 +13,32 @@ import numpy as np
 import serial
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from pynput.keyboard import Controller, Key
+from scipy.signal import find_peaks
 from serial.tools import list_ports
 
 mpl.use("TkAgg")
-plt.ion()
 
 keyboard = Controller()
-media_keys = [*filter(lambda attr: attr.startswith("media"), dir(Key))]
+
+media_keys = {
+    "None": lambda: None,
+    "Play/Pause": partial(keyboard.press, Key.media_play_pause),
+    "Previous": partial(keyboard.press, Key.media_previous),
+    "Next": partial(keyboard.press, Key.media_next),
+    "Volume Up": partial(keyboard.press, Key.media_volume_up),
+    "Volume Down": partial(keyboard.press, Key.media_volume_down),
+    "Mute": partial(keyboard.press, Key.media_volume_mute),
+    }
 
 SIGMA = 25
 BAUDRATE = 230400
 SAMPLE_FREQ = 20000  # samples per second
-WINDOW_SECONDS = 0.1
+CHUNK_SECONDS = 0.1
+CHUNK_SIZE = int(SAMPLE_FREQ * CHUNK_SECONDS)
+WINDOW_SECONDS = 1.0
 WINDOW_SIZE = int(SAMPLE_FREQ * WINDOW_SECONDS)
 BUFFER_SECONDS = 10.0
-BUFFER_SIZE = int(BUFFER_SECONDS * WINDOW_SIZE)
+BUFFER_SIZE = int(SAMPLE_FREQ * BUFFER_SECONDS)
 
 
 class EyeMovement(Enum):
@@ -35,6 +48,23 @@ class EyeMovement(Enum):
     DOUBLE_BLINK = "double_blink"
     DOUBLE_LEFT = "double_left"
     DOUBLE_RIGHT = "double_right"
+
+    def __mul__(self, other):
+        if not isinstance(other, int):
+            raise ValueError("Multiplier must be an integer")
+        elif other <= 0:
+            raise ValueError("Multiplier must be a positive integer")
+        if other == 1:
+            return self
+        match self:
+            case EyeMovement.BLINK:
+                return EyeMovement.DOUBLE_BLINK
+            case EyeMovement.LEFT:
+                return EyeMovement.DOUBLE_LEFT
+            case EyeMovement.RIGHT:
+                return EyeMovement.DOUBLE_RIGHT
+            case _:
+                return self
 
 
 class Config:
@@ -50,17 +80,20 @@ class Config:
         try:
             with open(self.PORT_PATH) as file:
                 self.port = file.read()
-            self.serial = serial.Serial(self.port, BAUDRATE, timeout=WINDOW_SECONDS)
             if self.port not in (port.device for port in list_ports.comports()):
                 self.port = None
         except FileNotFoundError:
             self.port = None
+        if self.port is not None:
+            self.serial = serial.Serial(self.port, BAUDRATE)
+        else:
+            self.serial = None
 
     def set_port(self, port):
         self.port = port
         with open(self.PORT_PATH, "w") as file:
             file.write(port)
-        self.serial = serial.Serial(port, BAUDRATE, timeout=WINDOW_SECONDS)
+        self.serial = serial.Serial(port, BAUDRATE)
 
     def load_keymap(self):
         try:
@@ -68,11 +101,9 @@ class Config:
                 self.keymap = json.load(file)
         except FileNotFoundError:
             self.keymap = {
-                "blink": "media_play_pause",
-                "up": "media_volume_up",
-                "down": "media_volume_down",
-                "left": "media_previous",
-                "right": "media_next",
+                "blink": "Play/Pause",
+                "left": "Previous",
+                "right": "Next",
             }
             self.dump_keymap()
 
@@ -88,23 +119,102 @@ class Config:
         self.dump_keymap()
 
 
-def process(app):
+config = Config()
+data = np.full(BUFFER_SIZE, 500.0)
+chunks = queue.Queue()
+
+
+def process():
+    global data, data_time
     while True:
-        read_bytes = iter(app.config.serial.read(WINDOW_SIZE))
-        data = []
+        if config.serial is None:
+            continue
+        read_bytes = iter(config.serial.read(CHUNK_SIZE))
+        chunk = []
         while (raw_byte := next(read_bytes, None)) is not None:
             raw_int = int(raw_byte)
             if raw_int > 0x7F:
-                data.append((np.bitwise_and(raw_byte, 0x7F) << 7)
+                chunk.append((np.bitwise_and(raw_byte, 0x7F) << 7)
                             + int(next(read_bytes)))
-        if len(data) < WINDOW_SIZE:
+        if len(chunk) == 0:
             continue
-        data = np.array(data)
-        data = np.fft.fftshift(np.fft.fft(data))
-        time = np.linspace(-WINDOW_SECONDS/2, WINDOW_SECONDS/2, WINDOW_SIZE)
-        gaussian_filter = np.exp(-time ** 2 / SIGMA ** 2)
-        data = np.fft.ifft(np.fft.ifftshift(data * gaussian_filter))
-        app.data = np.append(app.data[len(data):], data)
+        chunk = np.array(chunk)
+        chunk = np.fft.fftshift(np.fft.fft(chunk))
+        max_freq = len(chunk) / CHUNK_SECONDS
+        freq_list = np.linspace(-max_freq / 2, max_freq / 2, len(chunk))
+        gaussian_filter = np.exp(-freq_list ** 2 / SIGMA ** 2)
+        chunk = np.fft.ifft(np.fft.ifftshift(chunk * gaussian_filter))
+        chunks.put(chunk)
+        data = np.append(data[len(chunk):], np.real(chunk))
+        myapp.update_plot()
+
+
+def classify():
+    window = np.zeros(WINDOW_SIZE)
+    event = None
+
+    while (chunk := chunks.get()) is not None:
+        window = np.append(window[len(chunk):], chunk)
+
+        # continuous event detection
+        # print(np.std(window), np.mean(window), np.max(window), np.min(window),
+        #       window.size)
+        if np.std(window) > np.sqrt(300):
+            # print("window event detected")
+            if event is None:
+                event = window
+                print("event start")
+            else:
+                event = np.append(event, window)
+                # print("event continue")
+            continue
+        elif event is None:
+            # print("window has no event")
+            continue
+
+        # event classification
+        print("event end")
+
+        high_peaks, _ = find_peaks(event, prominence=50)
+        low_peaks, _ = find_peaks(-event, prominence=50)
+        if len(high_peaks) == 0 or len(low_peaks) == 0:
+            event = None
+            continue
+        peaks = np.sort(np.concatenate((high_peaks, low_peaks)))
+        peak_mean_diff = np.diff(peaks).mean()
+        print(f"{peak_mean_diff = }")
+        if peak_mean_diff < 200:
+            movement = EyeMovement.BLINK
+            movement *= (len(peaks) - 1) // 3
+        else:
+            high_peaks, _ = find_peaks(event, prominence=80)
+            low_peaks, _ = find_peaks(-event, prominence=80)
+            if len(high_peaks) < 1 or len(low_peaks) < 1:
+                event = None
+                continue
+            if high_peaks[0] < low_peaks[0]:
+                movement = EyeMovement.LEFT
+            else:
+                movement = EyeMovement.RIGHT
+            movement *= (len(high_peaks) + len(low_peaks) - 1) // 2
+        action(movement)
+
+        # reset
+        event = None
+
+
+action_toggle = False
+
+
+def action(movement):
+    global action_toggle
+    app.popup(movement.value)
+    key = config.keymap.get(movement.value)
+    if movement == EyeMovement.DOUBLE_BLINK:
+        action_toggle = not action_toggle
+        app.popup("Action " + ("enabled" if action_toggle else "disabled"))
+    if key is not None:
+        media_keys[key]()
 
 
 class App(tk.Frame):
@@ -113,59 +223,80 @@ class App(tk.Frame):
         super().__init__(parent)
         self.pack()
 
-        self.config = Config()
         self.serial_frame = self.create_serial_frame()
-        for movement in EyeMovement:
-            self.create_keymap_frame(movement)
+        self.keymap_frames = ttk.Frame(self)
+        self.keymap_frames.pack()
+        for i, movement in enumerate([
+            EyeMovement.BLINK,
+            EyeMovement.LEFT,
+            EyeMovement.RIGHT,
+            EyeMovement.DOUBLE_LEFT,
+            EyeMovement.DOUBLE_RIGHT
+            ]):
+            self.create_keymap_frame(i, movement)
 
         self.figure = plt.figure(figsize=(12, 4))
         self.canvas = FigureCanvasTkAgg(self.figure, self)
         self.canvas.get_tk_widget().pack()
-
-        self.data = np.zeros(BUFFER_SIZE)
-        threading.Thread(target=process, args=(self,), daemon=True).start()
         self.update_plot()
+
+        self.popup_frame = ttk.Frame(self)
+        self.popup_frame.place(relx=1, rely=0, anchor=tk.NE)
+        self.popup("Double blink to active/deactivate actions")
+
+
+    def popup(self, message):
+        label = tk.Label(self.popup_frame,
+                         text=message,
+                         bg="lightgrey",
+                         fg="black",
+                         )
+        label.pack(anchor=tk.E, pady=(0, 5))
+        self.after(5_000, label.destroy)
 
     def create_serial_frame(self):
         frame = ttk.Frame(self)
-        frame.pack()
+        frame.pack(anchor=tk.W, padx=5, pady=5)
 
-        label = ttk.Label(frame, text="Serial port")
+        label = ttk.Label(frame, text="Device")
         label.pack(side=tk.LEFT)
 
-        combobox = ttk.Combobox(
-            frame, values=[port.device for port in list_ports.comports()]
-        )
+        devices = [port.device for port in list_ports.comports()]
+        combobox = ttk.Combobox(frame, values=devices)
         combobox.pack(side=tk.RIGHT)
 
-        selected = self.config.port
-        if selected:
-            combobox.current(
-                [port.device for port in list_ports.comports()].index(selected)
-            )
+        selected = config.port
+        if selected and selected in devices:
+            combobox.current(devices.index(selected))
+        else:
+            self.after(100, partial(self.popup,
+                                    "Device not found, please select one"))
         combobox.bind(
             "<<ComboboxSelected>>",
-            lambda _: self.config.set_port(combobox.get()),
+            lambda _: config.set_port(combobox.get()),
         )
 
         return frame
 
-    def create_keymap_frame(self, movement):
-        frame = ttk.Frame(self)
-        frame.pack()
+    def create_keymap_frame(self, i, movement):
+        frame = ttk.Frame(self.keymap_frames)
+        frame.grid(row=i // 3, column=i % 3, padx=5, pady=5)
 
-        label = ttk.Label(frame, text=movement.value)
+        text = movement.value.replace("_", " ").capitalize()
+        label = ttk.Label(frame, text=text, width=9, anchor=tk.W)
         label.pack(side=tk.LEFT)
 
-        combobox = ttk.Combobox(frame, values=media_keys)
+        combobox = ttk.Combobox(frame, values=[*media_keys.keys()])
         combobox.pack(side=tk.RIGHT)
 
-        selected = self.config.keymap.get(movement.value)
+        selected = config.keymap.get(movement.value)
         if selected:
-            combobox.current(media_keys.index(selected))
+            combobox.current(list(media_keys).index(selected))
+        else:
+            combobox.current(0)
         combobox.bind(
             "<<ComboboxSelected>>",
-            lambda _: self.config.set_keymap(movement.value, combobox.get()),
+            lambda _: config.set_keymap(movement.value, combobox.get()),
         )
 
         return frame
@@ -173,13 +304,13 @@ class App(tk.Frame):
     def update_plot(self):
         ax = self.figure.gca()
         ax.clear()
-        ax.plot(self.data)
-        ax.set_xlim(0, BUFFER_SIZE)
-        ax.set_axis_off()
+        ax.plot(data)
         self.canvas.draw()
 
-        root.after(int(WINDOW_SECONDS * 1_000), self.update_plot)
 
 root = tk.Tk()
-myapp = App(root)
-myapp.mainloop()
+app = App(root)
+
+threading.Thread(target=process, daemon=True).start()
+threading.Thread(target=classify, daemon=True).start()
+app.mainloop()
